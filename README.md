@@ -71,6 +71,41 @@ npm run dev
 | 口径重算引擎 | `recalc_engine` | 重算任务 | 关联指标、新口径版本、历史时间范围 |
 | 字段血缘 | `field_lineage` | 字段血缘 | 目标字段、来源字段列表、转换逻辑 |
 
+## 字段血缘影响评估 → 口径重算试算
+
+字段血缘可以按依赖版本导出「影响评估文件」，交给口径重算引擎做跨模块历史
+数据试算。字段身份是「模型 + 字段」，两个模型里的同名字段是两条独立血缘。
+
+### 依赖版本与领取语义
+
+- 一次发布把某个模型字段的上游身份和下游引用边（查询/接口/报告）冻结成一版依赖，
+  版本号写在文件里（`version.version_id`、`version.version_no`）。
+- 同一次发布前后可能有两版依赖。查询已更新、接口/报告还没切换时，负责人可以：
+  - 先领取上一完整版本，按原范围安排回算；或
+  - 等这一轮引用全部就绪再领取新版，刚接入的指标也会纳入估算。
+- 只覆盖部分引用类型的发布记为 `切换中`，不会被当作可领取版本；下载只交付
+  一版完整依赖。发布与下载并发时，每笔下载看到的是某一完整版本，不会拼装。
+- 同一指标同一天有多条路径到达时，路径明细全部保留，但回算单元只计一次。
+
+### 接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/cross/field-lineage/identities` | 列出字段身份与可领取版本 |
+| GET | `/api/cross/field-lineage/{model}/{field}/versions` | 版本链 |
+| POST | `/api/cross/field-lineage/{model}/{field}/switch-references` | 切换查询/接口/报告的指标日期（`commit=false` 只暂存） |
+| POST | `/api/cross/field-lineage/{model}/{field}/references` | 接入新的下游引用（如本轮新接入的指标） |
+| POST | `/api/cross/field-lineage/{model}/{field}/publish` | 发布一版依赖（整轮就绪才是完整版本） |
+| GET | `/api/cross/field-lineage/{model}/{field}/impact-assessment` | 导出影响评估文件（可带 `version_id`） |
+| POST | `/api/cross/recalc/impact-assessment/inspect` | 只解析文件，返回回算单元与路径明细 |
+| POST | `/api/cross/recalc/impact-assessment/estimate` | 按文件里的依赖版本做历史数据试算 |
+| GET | `/api/cross/recalc/impact-assessments` | 试算受理记录 |
+
+`estimate` / `inspect` 直接接收文件内容作为请求体，`X-Filename` 头用于留档。
+试算以文件内容为准：后续再发生切换，重新提交最早的原文件仍按原文件的依赖核算。
+
+前端在「字段血缘」和「口径重算引擎」两个模块页下方提供对应操作面板。
+
 ## 约定
 
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。

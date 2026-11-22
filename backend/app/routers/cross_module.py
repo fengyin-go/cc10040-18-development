@@ -3,10 +3,16 @@
 链1: metric_definition -> caliber_version -> query_builder -> data_service -> cache_layer -> query_journal
 链2: dimension_model -> drill_down -> pivot_table -> report_template
 链3: user_cohort -> experiment_group -> segment_compare -> anomaly_detector
+字段血缘 -> 口径重算引擎: 依赖发布 -> 影响评估文件 -> 历史数据试算
 """
 from __future__ import annotations
 
-from fastapi import APIRouter
+import json
+from typing import Any
+from urllib.parse import quote, unquote
+
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import Response
 
 from app.services.metric_definition import MetricDefinitionService
 from app.services.caliber_version import CaliberVersionService
@@ -22,8 +28,12 @@ from app.services.user_cohort import UserCohortService
 from app.services.experiment_group import ExperimentGroupService
 from app.services.segment_compare import SegmentCompareService
 from app.services.anomaly_detector import AnomalyDetectorService
-from app.services.recalc_engine import RecalcEngineService
-from app.services.field_lineage import FieldLineageService
+from app.services.recalc_engine import (
+    AssessmentError,
+    RecalcEngineService,
+)
+from app.services.field_lineage import FieldLineageService, LinkageError
+from app.store import store
 
 router = APIRouter(prefix="/api/cross", tags=["跨模块数据流"])
 
@@ -284,6 +294,166 @@ def field_downstream_impact(field_name: str):
     """分析字段变更下游影响"""
     svc = FieldLineageService()
     return svc.get_downstream_impact(field_name)
+
+
+# ── 字段血缘依赖发布 / 影响评估导出 ──
+
+@router.get("/field-lineage/identities")
+def list_field_identities():
+    """列出可导出影响评估的字段身份（模型 + 字段）。"""
+    return {"items": FieldLineageService().list_field_identities()}
+
+
+@router.get("/field-lineage/{model}/{field}/versions")
+def list_lineage_versions(model: str, field: str):
+    """列出某个字段身份的依赖版本链。"""
+    svc = FieldLineageService()
+    try:
+        svc.require_identity(model, field)
+    except LinkageError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"field_identity": f"{model}.{field}",
+            "items": svc.list_versions(model, field)}
+
+
+@router.post("/field-lineage/{model}/{field}/switch-references")
+def switch_lineage_references(
+    model: str,
+    field: str,
+    ref_types: str = Query(description="逗号分隔：query,service,report"),
+    metric: str = Query(),
+    metric_date: str = Query(),
+    commit: bool = Query(default=True),
+):
+    """把查询/接口/报告的引用切到新的指标日期。
+
+    commit=false 只登记待发布状态，等这一轮引用全部就绪后再一起发布。
+    """
+    svc = FieldLineageService()
+    try:
+        result = svc.switch_references(
+            model, field,
+            ref_types=[item.strip() for item in ref_types.split(",") if item.strip()],
+            metric=metric,
+            metric_date=metric_date,
+            commit=commit,
+        )
+    except LinkageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "message": "引用切换已登记" if commit else "引用切换已暂存",
+            "entry": result}
+
+
+@router.post("/field-lineage/{model}/{field}/references")
+def attach_lineage_reference(
+    model: str,
+    field: str,
+    ref_key: str = Query(),
+    ref_type: str = Query(description="query/service/report"),
+    ref_name: str = Query(default=""),
+    metric: str = Query(),
+    metric_date: str = Query(),
+    upstream_ids: str = Query(description="逗号分隔的上游身份 ID"),
+    ref_id: int = Query(default=0),
+    path_key: str = Query(default="direct"),
+):
+    """接入一条新的下游引用（例如这一轮才接入的指标）。"""
+    svc = FieldLineageService()
+    try:
+        result = svc.attach_reference(
+            model, field,
+            ref_key=ref_key,
+            ref_type=ref_type,
+            ref_name=ref_name,
+            metric=metric,
+            metric_date=metric_date,
+            upstream_ids=[item.strip() for item in upstream_ids.split(",") if item.strip()],
+            ref_id=ref_id,
+            path_key=path_key,
+        )
+    except LinkageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "message": "下游引用已接入", "entry": result}
+
+
+@router.post("/field-lineage/{model}/{field}/publish")
+def publish_lineage_version(
+    model: str,
+    field: str,
+    ref_types: str | None = Query(default=None, description="留空表示整轮引用就绪"),
+    note: str = Query(default=""),
+):
+    """发布一版字段依赖（整轮就绪才算完整版本）。"""
+    svc = FieldLineageService()
+    try:
+        result = svc.publish_dependency_version(
+            model, field,
+            ref_types=([item.strip() for item in ref_types.split(",") if item.strip()]
+                       if ref_types else None),
+            note=note,
+        )
+    except LinkageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "message": f"已发布依赖版本 {result['version_id']}", "entry": result}
+
+
+@router.get("/field-lineage/{model}/{field}/impact-assessment")
+def download_impact_assessment(
+    model: str, field: str,
+    version_id: str | None = Query(default=None),
+):
+    """导出字段血缘影响评估文件（只交付一版完整依赖，版本写在文件里）。"""
+    svc = FieldLineageService()
+    try:
+        assessment = svc.build_impact_assessment(model, field, version_id=version_id)
+    except LinkageError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    body = json.dumps(assessment, ensure_ascii=False, indent=2).encode("utf-8")
+    identity = assessment["field_identity"]
+    version_id = assessment["version"]["version_id"]
+    ascii_name = f"impact-assessment-{version_id}.json"
+    utf8_name = quote(f"影响评估_{identity}_{version_id}.json")
+    return Response(
+        content=body,
+        media_type="application/json; charset=utf-8",
+        headers={
+            "Content-Disposition":
+                f"attachment; filename=\"{ascii_name}\"; "
+                f"filename*=UTF-8''{utf8_name}",
+            "X-Assessment-Version": version_id,
+            "X-Field-Identity": quote(identity),
+        },
+    )
+
+
+# ── 影响评估文件试算（口径重算引擎） ──
+
+@router.post("/recalc/impact-assessment/inspect")
+async def inspect_impact_assessment(request: Request):
+    """解析影响评估文件内容，返回回算单元与路径明细（不上报历史记录）。"""
+    raw = await request.body()
+    try:
+        return RecalcEngineService().ingest_assessment(raw)
+    except AssessmentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/recalc/impact-assessment/estimate")
+async def estimate_impact_assessment(request: Request):
+    """按影响评估文件的依赖版本执行跨模块历史数据试算。"""
+    raw = await request.body()
+    filename = unquote(request.headers.get("X-Filename", ""))
+    try:
+        return RecalcEngineService().estimate_from_assessment(raw, filename=filename)
+    except AssessmentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/recalc/impact-assessments")
+def list_assessment_runs():
+    """影响评估试算的受理记录（按文件里的依赖版本留档）。"""
+    runs = store.assessment_runs()
+    return {"items": runs, "total": len(runs)}
 
 
 # ── 全链路快照 ──

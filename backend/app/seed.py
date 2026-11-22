@@ -3,6 +3,157 @@ from __future__ import annotations
 
 from typing import Any
 
+# ── 字段血缘依赖的跨模块引用（字段级，和模型身份绑定） ──
+# 同名字段 amount 在两个模型下是两条独立血缘：模型 + 字段 才是字段身份。
+LINEAGE_UPSTREAMS: list[dict[str, Any]] = [
+    {
+        "upstream_id": "UP-EC-01",
+        "target_field": "amount",
+        "source_type": "table",
+        "table": "dwd_trade_order",
+        "field": "pay_amount",
+        "model": "电商交易模型",
+        "identity": "table:dwd_trade_order.pay_amount",
+        "transform": "sum(pay_amount) - sum(refund_amount)",
+    },
+    {
+        "upstream_id": "UP-EC-02",
+        "target_field": "amount",
+        "source_type": "table",
+        "table": "dwd_trade_refund",
+        "field": "refund_amount",
+        "model": "电商交易模型",
+        "identity": "table:dwd_trade_refund.refund_amount",
+        "transform": "sum(refund_amount)",
+    },
+    {
+        "upstream_id": "UP-EXT-01",
+        "target_field": "amount",
+        "source_type": "table",
+        "table": "dwd_channel_settle",
+        "field": "settle_amount",
+        "model": "电商交易模型",
+        "identity": "table:dwd_channel_settle.settle_amount",
+        "transform": "sum(settle_amount)",
+    },
+    {
+        "upstream_id": "UP-ST-01",
+        "target_field": "amount",
+        "source_type": "table",
+        "table": "dwd_store_sale",
+        "field": "sale_amount",
+        "model": "门店零售模型",
+        "identity": "table:dwd_store_sale.sale_amount",
+        "transform": "sum(sale_amount) - sum(return_amount)",
+    },
+    {
+        "upstream_id": "UP-ST-02",
+        "target_field": "amount",
+        "source_type": "table",
+        "table": "dwd_store_return",
+        "field": "return_amount",
+        "model": "门店零售模型",
+        "identity": "table:dwd_store_return.return_amount",
+        "transform": "sum(return_amount)",
+    },
+]
+
+# 每条下游引用边都归到「实际要回算的指标 + 日期」。
+LINEAGE_REFERENCE_SEEDS: list[dict[str, Any]] = [
+    {
+        "ref_key": "QRY-EC-GMV",
+        "ref_type": "query",
+        "ref_id": 101,
+        "ref_name": "电商GMV汇总查询",
+        "model": "电商交易模型",
+        "field": "amount",
+        "metric": "GMV",
+        "metric_date": "2026-10-01",
+        "upstream_ids": ["UP-EC-01", "UP-EC-02"],
+        "path_key": "direct",
+    },
+    {
+        "ref_key": "API-EC-GMV",
+        "ref_type": "service",
+        "ref_id": 101,
+        "ref_name": "电商GMV开放接口",
+        "model": "电商交易模型",
+        "field": "amount",
+        "metric": "GMV",
+        "metric_date": "2026-10-01",
+        "upstream_ids": ["UP-EC-01", "UP-EC-02"],
+        "path_key": "direct",
+    },
+    {
+        "ref_key": "RPT-EC-GMV",
+        "ref_type": "report",
+        "ref_id": 101,
+        "ref_name": "电商经营日报",
+        "model": "电商交易模型",
+        "field": "amount",
+        "metric": "GMV",
+        "metric_date": "2026-10-01",
+        "upstream_ids": ["UP-EC-01", "UP-EC-02"],
+        "path_key": "direct",
+    },
+    # 同一指标同一天的第二条到达路径：经过渠道结算表，保留为独立来源明细，
+    # 但回算单元 (指标 + 日期) 仍只计一次。
+    {
+        "ref_key": "API-EC-GMV-ALT",
+        "ref_type": "service",
+        "ref_id": 103,
+        "ref_name": "电商GMV渠道核对接口",
+        "model": "电商交易模型",
+        "field": "amount",
+        "metric": "GMV",
+        "metric_date": "2026-10-01",
+        "upstream_ids": ["UP-EC-01", "UP-EXT-01"],
+        "path_key": "channel_settle",
+    },
+    {
+        "ref_key": "QRY-ST-AMT",
+        "ref_type": "query",
+        "ref_id": 102,
+        "ref_name": "门店销售额查询",
+        "model": "门店零售模型",
+        "field": "amount",
+        "metric": "门店销售额",
+        "metric_date": "2026-10-01",
+        "upstream_ids": ["UP-ST-01", "UP-ST-02"],
+        "path_key": "direct",
+    },
+    {
+        "ref_key": "API-ST-AMT",
+        "ref_type": "service",
+        "ref_id": 102,
+        "ref_name": "门店销售额接口",
+        "model": "门店零售模型",
+        "field": "amount",
+        "metric": "门店销售额",
+        "metric_date": "2026-10-01",
+        "upstream_ids": ["UP-ST-01", "UP-ST-02"],
+        "path_key": "direct",
+    },
+    {
+        "ref_key": "RPT-ST-AMT",
+        "ref_type": "report",
+        "ref_id": 102,
+        "ref_name": "门店经营周报",
+        "model": "门店零售模型",
+        "field": "amount",
+        "metric": "门店销售额",
+        "metric_date": "2026-10-01",
+        "upstream_ids": ["UP-ST-01", "UP-ST-02"],
+        "path_key": "direct",
+    },
+]
+
+# 初始完整依赖版本：两个模型各自先有一版，下载时才不会落空。
+LINEAGE_VERSION_SEEDS: list[dict[str, str]] = [
+    {"model": "电商交易模型", "field": "amount", "note": "初始完整依赖"},
+    {"model": "门店零售模型", "field": "amount", "note": "初始完整依赖"},
+]
+
 SEED_ROWS: dict[str, list[dict[str, Any]]] = {
     "metric_definition": [{'id': 1,
   'status': '草稿',
